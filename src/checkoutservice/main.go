@@ -37,9 +37,12 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -48,6 +51,8 @@ const (
 )
 
 var log *logrus.Logger
+
+var checkoutTracer = otel.Tracer("online-boutique/checkout-business-flow")
 
 func init() {
 	log = logrus.New()
@@ -228,18 +233,39 @@ func (cs *checkoutService) Watch(req *healthpb.HealthCheckRequest, ws healthpb.H
 }
 
 func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderRequest) (*pb.PlaceOrderResponse, error) {
+	ctx, span := checkoutTracer.Start(ctx, "checkout.place_order",
+		trace.WithAttributes(
+			attribute.String("app.business_flow", "checkout"),
+			attribute.String("app.user_currency", req.UserCurrency),
+			attribute.String("app.shipping_country", req.GetAddress().GetCountry()),
+		))
+	defer span.End()
+
 	log.Infof("[PlaceOrder] user_id=%q user_currency=%q", req.UserId, req.UserCurrency)
 
 	orderID, err := uuid.NewUUID()
 	if err != nil {
+		recordSpanError(span, err, "failed to generate order uuid")
 		return nil, status.Errorf(codes.Internal, "failed to generate order uuid")
 	}
+	span.SetAttributes(attribute.String("app.order_id", orderID.String()))
 
-	prep, err := cs.prepareOrderItemsAndShippingQuoteFromCart(ctx, req.UserId, req.UserCurrency, req.Address)
+	prepCtx, prepSpan := checkoutTracer.Start(ctx, "checkout.prepare_cart_and_shipping")
+	prep, err := cs.prepareOrderItemsAndShippingQuoteFromCart(prepCtx, req.UserId, req.UserCurrency, req.Address)
 	if err != nil {
+		recordSpanError(prepSpan, err, "failed to prepare cart and shipping")
+		prepSpan.End()
+		recordSpanError(span, err, "failed to prepare order")
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}
+	prepSpan.SetAttributes(
+		attribute.Int("app.cart.item_count", len(prep.cartItems)),
+		attribute.Int("app.order.item_count", len(prep.orderItems)),
+		attribute.String("app.shipping.currency", prep.shippingCostLocalized.GetCurrencyCode()),
+	)
+	prepSpan.End()
 
+	_, totalSpan := checkoutTracer.Start(ctx, "checkout.calculate_order_total")
 	total := pb.Money{CurrencyCode: req.UserCurrency,
 		Units: 0,
 		Nanos: 0}
@@ -248,19 +274,47 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 		multPrice := money.MultiplySlow(*it.Cost, uint32(it.GetItem().GetQuantity()))
 		total = money.Must(money.Sum(total, multPrice))
 	}
+	totalSpan.SetAttributes(
+		attribute.String("app.order.currency", total.GetCurrencyCode()),
+		attribute.Int64("app.order.total_units", total.GetUnits()),
+		attribute.Int("app.order.total_nanos", int(total.GetNanos())),
+	)
+	totalSpan.End()
 
-	txID, err := cs.chargeCard(ctx, &total, req.CreditCard)
+	chargeCtx, chargeSpan := checkoutTracer.Start(ctx, "checkout.charge_payment",
+		trace.WithAttributes(
+			attribute.String("app.payment.currency", total.GetCurrencyCode()),
+			attribute.Int64("app.payment.amount_units", total.GetUnits()),
+		))
+	txID, err := cs.chargeCard(chargeCtx, &total, req.CreditCard)
 	if err != nil {
+		recordSpanError(chargeSpan, err, "payment charge failed")
+		chargeSpan.End()
+		recordSpanError(span, err, "failed to charge card")
 		return nil, status.Errorf(codes.Internal, "failed to charge card: %+v", err)
 	}
+	chargeSpan.SetAttributes(attribute.String("app.payment.transaction_id", txID))
+	chargeSpan.End()
 	log.Infof("payment went through (transaction_id: %s)", txID)
 
-	shippingTrackingID, err := cs.shipOrder(ctx, req.Address, prep.cartItems)
+	shipCtx, shipSpan := checkoutTracer.Start(ctx, "checkout.ship_order",
+		trace.WithAttributes(attribute.Int("app.shipment.item_count", len(prep.cartItems))))
+	shippingTrackingID, err := cs.shipOrder(shipCtx, req.Address, prep.cartItems)
 	if err != nil {
+		recordSpanError(shipSpan, err, "shipping failed")
+		shipSpan.End()
+		recordSpanError(span, err, "shipping error")
 		return nil, status.Errorf(codes.Unavailable, "shipping error: %+v", err)
 	}
+	shipSpan.SetAttributes(attribute.String("app.shipping.tracking_id", shippingTrackingID))
+	shipSpan.End()
 
-	_ = cs.emptyUserCart(ctx, req.UserId)
+	emptyCtx, emptySpan := checkoutTracer.Start(ctx, "checkout.empty_cart")
+	if err := cs.emptyUserCart(emptyCtx, req.UserId); err != nil {
+		recordSpanError(emptySpan, err, "failed to empty cart")
+		log.Warnf("failed to empty cart for user %q: %+v", req.UserId, err)
+	}
+	emptySpan.End()
 
 	orderResult := &pb.OrderResult{
 		OrderId:            orderID.String(),
@@ -270,13 +324,22 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 		Items:              prep.orderItems,
 	}
 
-	if err := cs.sendOrderConfirmation(ctx, req.Email, orderResult); err != nil {
+	emailCtx, emailSpan := checkoutTracer.Start(ctx, "checkout.send_confirmation_email")
+	if err := cs.sendOrderConfirmation(emailCtx, req.Email, orderResult); err != nil {
+		recordSpanError(emailSpan, err, "failed to send order confirmation")
 		log.Warnf("failed to send order confirmation to %q: %+v", req.Email, err)
 	} else {
 		log.Infof("order confirmation email sent to %q", req.Email)
 	}
+	emailSpan.End()
+	span.SetAttributes(attribute.String("app.checkout.result", "success"))
 	resp := &pb.PlaceOrderResponse{Order: orderResult}
 	return resp, nil
+}
+
+func recordSpanError(span trace.Span, err error, description string) {
+	span.RecordError(err)
+	span.SetStatus(otelcodes.Error, description)
 }
 
 type orderPrep struct {
